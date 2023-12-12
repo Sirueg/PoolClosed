@@ -38,7 +38,7 @@ public class PoolManager<K, T> {
     private PoolableResource<K, T> createResource() {
         var newResource = resourceFactory.create();
         resources.add(newResource);
-        log.info("Created new resource {}, size is {}", newResource,resources.size());
+        log.info("Created new resource {}, size is {}", newResource, resources.size());
         return newResource;
     }
 
@@ -109,7 +109,7 @@ public class PoolManager<K, T> {
                 .forEach(this::removeAndKill);
 
         Set<PoolableResource<K, T>> expiredResources = liveResources.stream()
-                .filter(resource -> resource.lastActionTime() < System.currentTimeMillis())
+                .filter(resource -> (resource.lastActionTime() + poolConfig.getTimeout()) < System.currentTimeMillis())
                 .collect(Collectors.toSet());
         liveResources.removeAll(expiredResources);
         expiredResources.stream()
@@ -122,5 +122,4 @@ public class PoolManager<K, T> {
         liveResources.remove(resource);
         resource.kill();
     }
-
 }
