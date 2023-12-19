@@ -54,8 +54,7 @@ public final class PoolManager<RESPONSE, REQUEST> {
             return Optional.empty();
         }
         var newResource = resourceFactory.create();
-        resources.add(newResource);
-        //log.info("Created new resource {}, size is {}", newResource, resources.size());
+        resources.add(newResource);        
         return Optional.of(newResource);
     }
 
