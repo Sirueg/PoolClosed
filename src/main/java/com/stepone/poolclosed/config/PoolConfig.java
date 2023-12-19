@@ -9,7 +9,7 @@ import lombok.NoArgsConstructor;
 @AllArgsConstructor
 public class PoolConfig {
     private int poolSize = 10;
-    private int maxPoolSize = 50;
-    private int maxIdleTime = 500;
-    private int timeout=5000;
+    private int maxPoolSize = 15;
+    private int maxIdleTime = 1500;
+    private int timeout=10000;
 }

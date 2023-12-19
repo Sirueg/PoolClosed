@@ -8,23 +8,37 @@ import lombok.extern.slf4j.Slf4j;
 
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
+/**
+ * PoolManager
+ *
+ * <p>Manages the pool of resources
+ *
+ * @param <RESPONSE> Response type
+ * @param <REQUEST> Request type
+ */
 @Slf4j
-public class PoolManager<K, T> {
+public final class PoolManager<RESPONSE, REQUEST> {
     private final PoolConfig poolConfig;
-    private final PoolableResourceFactory<K, T> resourceFactory;
-    private final Set<PoolableResource<K, T>> resources = ConcurrentHashMap.newKeySet();
-    private final Set<PoolableResource<K, T>> liveResources = ConcurrentHashMap.newKeySet();
+    private final PoolableResourceFactory<RESPONSE, REQUEST> resourceFactory;
+    private final Set<PoolableResource<RESPONSE, REQUEST>> resources = ConcurrentHashMap.newKeySet();
+    private final BlockingQueue<PoolableResource<RESPONSE, REQUEST>> liveResources;
 
-    public PoolManager(PoolableResourceFactory<K, T> resourceFactory, PoolConfig poolConfig) {
+    /**
+     * PoolManager constructor with PoolableResourceFactory and PoolConfig
+     *
+     * @param resourceFactory Factory for creating PoolableResource
+     * @param poolConfig      Pool configuration
+     */
+    public PoolManager(PoolableResourceFactory<RESPONSE, REQUEST> resourceFactory, PoolConfig poolConfig) {
         this.resourceFactory = resourceFactory;
         this.poolConfig = poolConfig;
+        this.liveResources = new LinkedBlockingQueue<>();
         //create initial resources
         for (int i = 0; i < poolConfig.getPoolSize(); i++) {
-            liveResources.add(createResource());
+            createResource().ifPresent(liveResources::add);
         }
     }
 
@@ -35,64 +49,72 @@ public class PoolManager<K, T> {
      *
      * @return newly created resource
      */
-    private PoolableResource<K, T> createResource() {
+    private Optional<PoolableResource<RESPONSE, REQUEST>> createResource() {
+        if (resources.size() >= poolConfig.getMaxPoolSize()) {
+            return Optional.empty();
+        }
         var newResource = resourceFactory.create();
         resources.add(newResource);
-        log.info("Created new resource {}, size is {}", newResource, resources.size());
-        return newResource;
+        //log.info("Created new resource {}, size is {}", newResource, resources.size());
+        return Optional.of(newResource);
     }
 
-    public CompletableFuture<Try<K>> execute(T action) {
-        PoolableResource<K, T> resource = getResource().orElseThrow(() -> new IllegalStateException("No resource available"));
+    /**
+     * Run action on resource and returns CompletableFuture with result
+     *
+     * @param action Action to run on resource
+     * @return CompletableFuture with result
+     */
+    public CompletableFuture<Try<RESPONSE>> execute(REQUEST action) {
+        PoolableResource<RESPONSE, REQUEST> resource = getResource().orElseThrow(() -> new IllegalStateException("No resource available"));
         return futureTrick(resource.execute(action), resource);
     }
 
-    private CompletableFuture<Try<K>> futureTrick(CompletableFuture<Try<K>> future, final PoolableResource<K, T> dataResource) {
+    /**
+     * Trick to add resource to liveResources after action is completed
+     *
+     * @param future       CompletableFuture to add trick to
+     * @param dataResource Resource to add to liveResources
+     * @return CompletableFuture with result
+     */
+    private CompletableFuture<Try<RESPONSE>> futureTrick(CompletableFuture<Try<RESPONSE>> future, final PoolableResource<RESPONSE, REQUEST> dataResource) {
         return future.thenApply(result -> {
-            liveResources.add(dataResource);
-            log.info("Released resource {} {}", dataResource.id(), result);
-            this.notifyFromOtherThread();
+            if (!liveResources.add(dataResource)) {
+                log.error("Could not add resource {} to queue, killing resource", dataResource.id());
+                dataResource.kill();
+                resources.remove(dataResource);
+            }
             return result;
         });
     }
 
-    public synchronized void notifyFromOtherThread() {
-        notify();
-    }
-
-    public synchronized Optional<PoolableResource<K, T>> getResource() {
-        Optional<PoolableResource<K, T>> liveResource = liveResources.stream()
-                .filter(r -> !r.isClosed())
-                .findFirst();
-
-        if (liveResource.isPresent()) {
-            log.info("Resource already free, recycling {}", liveResource.get().id());
-            liveResources.remove(liveResource.get());
-            return liveResource;
+    /**
+     * Get resource from pool and remove it from liveResources
+     *
+     * @return Optional with resource if available
+     */
+    public Optional<PoolableResource<RESPONSE, REQUEST>> getResource() {
+        var liveResource = liveResources.poll();
+        if (liveResource != null) {
+            return Optional.of(liveResource);
         }
 
-        if (resources.size() < poolConfig.getMaxPoolSize()) {
-            return Optional.of(createResource());
+        var createdResource = createResource();
+
+        if (createdResource.isPresent()) {
+            return createdResource;
         }
 
-        long waitTime = System.currentTimeMillis() + poolConfig.getTimeout();
-        while (System.currentTimeMillis() < waitTime) {
-            try {
-                wait(3000);
-            } catch (InterruptedException e) {
-                throw new RuntimeException(e);
+        try {
+            var resource = liveResources.poll(poolConfig.getTimeout(), TimeUnit.MILLISECONDS);
+            if (resource != null) {
+                return Optional.of(resource);
+            } else {
+                log.warn("Resource timed out");
             }
-            log.info("Waited for resource for {}", waitTime - System.currentTimeMillis());
-            liveResource = liveResources.stream()
-                    .filter(r -> !r.isClosed())
-                    .findFirst();
-            if (liveResource.isPresent()) {
-                log.info("Resource free, recicling {}", liveResource.get().id());
-                liveResources.remove(liveResource.get());
-                return liveResource;
-            }
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
         }
-
         return Optional.empty();
     }
 
@@ -100,26 +122,26 @@ public class PoolManager<K, T> {
      * Scheduled mainteinance run
      */
     public void scheduledRun() {
-        Set<PoolableResource<K, T>> closedResources = resources.stream()
+        Set<PoolableResource<RESPONSE, REQUEST>> closedResources = resources.stream()
                 .filter(PoolableResource::isClosed)
                 .collect(Collectors.toSet());
-        resources.removeAll(closedResources);
         closedResources.stream()
-                .filter(r -> !liveResources.contains(r))
+                .filter(liveResources::contains)
                 .forEach(this::removeAndKill);
-
-        Set<PoolableResource<K, T>> expiredResources = liveResources.stream()
-                .filter(resource -> (resource.lastActionTime() + poolConfig.getTimeout()) < System.currentTimeMillis())
+        Set<PoolableResource<RESPONSE, REQUEST>> expiredResources = liveResources.stream()
+                .filter(resource -> (resource.lastActionTime() + poolConfig.getMaxIdleTime()) < System.currentTimeMillis())
                 .collect(Collectors.toSet());
-        liveResources.removeAll(expiredResources);
         expiredResources.stream()
-                .filter(r -> !liveResources.contains(r))
+                .filter(liveResources::contains)
                 .forEach(this::removeAndKill);
+        log.info("Current resources {}", resources.size());
+        log.info("Current live resources {}", liveResources.size());
     }
 
-    private void removeAndKill(PoolableResource<K, T> resource) {
-        resources.remove(resource);
-        liveResources.remove(resource);
-        resource.kill();
+    private void removeAndKill(PoolableResource<RESPONSE, REQUEST> resource) {
+        if (liveResources.remove(resource)) {
+            resources.remove(resource);
+            resource.kill();
+        }
     }
 }

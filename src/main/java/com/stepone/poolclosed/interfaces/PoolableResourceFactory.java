@@ -1,6 +1,6 @@
 package com.stepone.poolclosed.interfaces;
 
-public interface PoolableResourceFactory<K,T> {
+public interface PoolableResourceFactory<RESPONSE, REQUEST> {
 
-    PoolableResource<K,T> create();
+    PoolableResource<RESPONSE, REQUEST> create();
 }
